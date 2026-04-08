@@ -40,6 +40,7 @@ func LaunchDownload(box *ui.Box, button *ui.Button, stop *ui.Button, opt Opts) {
 	case "single":
 		var wg sync.WaitGroup
 		SingleTDownload(&wg, opt, false, false)
+		wg.Wait()
 		ui.QueueMain(func() {
 			box.Delete(3)
 			button.Enable()
@@ -48,7 +49,7 @@ func LaunchDownload(box *ui.Box, button *ui.Button, stop *ui.Button, opt Opts) {
 
 	case "user":
 		UserTDownload(opt)
-		time.Sleep(1 * time.Second)
+		time.Sleep(500 * time.Millisecond)
 		ui.QueueMain(func() {
 			box.Delete(3)
 			button.Enable()
@@ -57,16 +58,13 @@ func LaunchDownload(box *ui.Box, button *ui.Button, stop *ui.Button, opt Opts) {
 
 	case "batch":
 		BatchTDownload(opt)
-		time.Sleep(1 * time.Second)
+		time.Sleep(500 * time.Millisecond)
 		ui.QueueMain(func() {
 			box.Delete(3)
 			button.Enable()
 			stop.Disable()
 		})
-		fmt.Println("Finish batch")
-
 	}
-	fmt.Println("Finish")
 }
 
 ///////////////
@@ -120,6 +118,9 @@ func SingleTweet() ui.Control {
 	LogSingle.SetReadOnly(true)
 	Form.Append("Downloads: ", LogSingle, true)
 
+	metadata := ui.NewCheckbox("Show metadata (likes, RTs, text)")
+	Form.Append("", metadata, false)
+
 	download := ui.NewButton("Download")
 	box.Append(download, false)
 
@@ -133,7 +134,8 @@ func SingleTweet() ui.Control {
 	stop := ui.NewButton("Stop")
 	stop.Disable()
 	stop.OnClicked(func(button *ui.Button) {
-		Stop <- true
+		TriggerStop()
+		stop.Disable()
 	})
 
 	grid.Append(exit,
@@ -158,8 +160,9 @@ func SingleTweet() ui.Control {
 		opt.Proxy = proxy.Text()
 		opt.Dtype = "single"
 		opt.Output = folder
+		opt.Metadata = metadata.Checked()
 
-		Stop = make(chan bool)
+		ResetStop()
 		go LaunchDownload(box, download, stop, opt)
 	})
 
@@ -184,9 +187,6 @@ func UserDownload() ui.Control {
 	group.SetChild(Form)
 
 	Username := ui.NewEntry()
-	Username.OnChanged(func(entry *ui.Entry) {
-		fmt.Scanln(Username.Text())
-	})
 	Form.Append("Username: ", Username, false)
 
 	media := ui.NewCombobox()
@@ -238,6 +238,13 @@ func UserDownload() ui.Control {
 	proxy := ui.NewEntry()
 	Form.Append("Proxy: ", proxy, false)
 
+	metadataUser := ui.NewCheckbox("Show metadata (likes, RTs, text)")
+	Form.Append("", metadataUser, false)
+
+	LogUser = ui.NewNonWrappingMultilineEntry()
+	LogUser.SetReadOnly(true)
+	Form.Append("Log: ", LogUser, true)
+
 	download := ui.NewButton("Download")
 	box.Append(download, false)
 
@@ -250,8 +257,7 @@ func UserDownload() ui.Control {
 
 	stop := ui.NewButton("Stop")
 	stop.OnClicked(func(button *ui.Button) {
-		Stop <- true
-		close(Stop)
+		TriggerStop()
 		stop.Disable()
 	})
 	stop.Disable()
@@ -274,6 +280,7 @@ func UserDownload() ui.Control {
 		opt.Retweet = retweet.Checked()
 		opt.Retweet_only = retweet_only.Checked()
 		opt.Dtype = "user"
+		opt.Metadata = metadataUser.Checked()
 
 		if Username.Text() == "" {
 			ui.MsgBoxError(windows,
@@ -282,7 +289,7 @@ func UserDownload() ui.Control {
 			return
 		}
 
-		Stop = make(chan bool)
+		ResetStop()
 		go LaunchDownload(box, download, stop, opt)
 	})
 
@@ -349,8 +356,7 @@ func BatchTweet() ui.Control {
 
 	stop := ui.NewButton("Stop")
 	stop.OnClicked(func(button *ui.Button) {
-		Stop <- true
-		close(Stop)
+		TriggerStop()
 		stop.Disable()
 	})
 	stop.Disable()
@@ -378,7 +384,7 @@ func BatchTweet() ui.Control {
 			return
 		}
 
-		Stop = make(chan bool)
+		ResetStop()
 		go LaunchDownload(box, download, stop, opt)
 	})
 

@@ -3,6 +3,7 @@ package utils
 import (
 	"bufio"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -31,6 +32,7 @@ type Opts struct {
 	Retweet      bool
 	Retweet_only bool
 	Proxy        string
+	Metadata     bool
 }
 
 var (
@@ -41,6 +43,7 @@ var (
 	rt        bool
 	GUI       bool
 	Stop      = make(chan bool)
+	stopOnce  sync.Once
 	quality   = map[int]string{
 		0: "orig",
 		1: "normal",
@@ -59,10 +62,64 @@ var (
 
 var download_id = make(chan string)
 
+// TriggerStop closes the Stop channel (idempotent — safe to call multiple times).
+func TriggerStop() {
+	stopOnce.Do(func() {
+		close(Stop)
+	})
+}
+
+// ResetStop creates a fresh Stop channel for a new download session.
+func ResetStop() {
+	Stop = make(chan bool)
+	stopOnce = sync.Once{}
+}
+
+
 func LogErr(err string) {
 	mu.Lock()
 	ui.QueueMain(func() {
 		Log.Append(err + "\n")
+	})
+	mu.Unlock()
+}
+
+func LogUserMsg(msg string) {
+	if LogUser == nil {
+		return
+	}
+	mu.Lock()
+	ui.QueueMain(func() {
+		LogUser.Append(msg + "\n")
+	})
+	mu.Unlock()
+}
+
+// logTweetInfo displays tweet metadata (likes, retweets, text, etc.) in the GUI.
+func logTweetInfo(tweet *twitterscraper.Tweet, logEntry *ui.MultilineEntry) {
+	if logEntry == nil {
+		return
+	}
+	ts := time.Unix(tweet.Timestamp, 0).Format("2006-01-02 15:04:05")
+	photoCount := len(tweet.Photos)
+	videoCount := len(tweet.Videos)
+
+	msg := fmt.Sprintf(
+		"--- @%s (%s) | %s ---\n"+
+			"%s\n"+
+			"Likes: %d  Retweets: %d  Replies: %d  Views: %d\n"+
+			"Media: %d photo(s), %d video(s)\n"+
+			"URL: %s\n",
+		tweet.Username, tweet.Name, ts,
+		tweet.Text,
+		tweet.Likes, tweet.Retweets, tweet.Replies, tweet.Views,
+		photoCount, videoCount,
+		tweet.PermanentURL,
+	)
+
+	mu.Lock()
+	ui.QueueMain(func() {
+		logEntry.Append(msg)
 	})
 	mu.Unlock()
 }
@@ -97,70 +154,89 @@ func UserTDownload(opt Opts) {
 	for tweet := range scraper.GetTweets(context.Background(), opt.Username, opt.Nbr) {
 		select {
 		case <-Stop:
+			wg.Wait()
 			return
 		default:
 		}
 
 		if tweet.Error != nil {
-			fmt.Println(tweet.Error)
-			return
+			LogErr(tweet.Error.Error())
+			continue
 		}
+
+		if opt.Metadata {
+			logTweetInfo(&tweet.Tweet, LogUser)
+		}
+
+		// Run synchronously to avoid WaitGroup race (wg.Add must happen before wg.Wait)
 		if opt.Media == "videos" || opt.Media == "all" {
-			go videoUser(&wg, tweet, opt)
+			videoUser(&wg, tweet, opt)
 		}
 		if opt.Media == "pictures" || opt.Media == "all" {
-			go photoUser(&wg, tweet, opt)
+			photoUser(&wg, tweet, opt)
 		}
 	}
 	wg.Wait()
-	fmt.Printf("Download %d tweet from %s", opt.Nbr, opt.Username)
+	if GUI {
+		LogUserMsg(fmt.Sprintf("Finished: downloaded from @%s", opt.Username))
+	} else {
+		fmt.Printf("Download finished: %d tweets from @%s\n", opt.Nbr, opt.Username)
+	}
 	time.Sleep(1 * time.Second)
 }
 
 func videoUser(wg *sync.WaitGroup, tweet *twitterscraper.TweetResult, opt Opts) {
-	if len(tweet.Videos) > 0 {
-		if tweet.IsRetweet && (opt.Retweet || opt.Retweet_only) {
-			opt.Tweet_id = tweet.ID
-			opt.Output = opt.Output + "/" + opt.Username
-			SingleTDownload(wg, opt, true, false)
+	if tweet.IsRetweet && (opt.Retweet || opt.Retweet_only) {
+		opt.Tweet_id = tweet.ID
+		rtOpt := opt
+		rtOpt.Output = opt.Output + "/" + opt.Username
+		SingleTDownload(wg, rtOpt, true, false)
+		return
+	}
+	if opt.Retweet_only {
+		return
+	}
+	for _, i := range tweet.Videos {
+		select {
+		case <-Stop:
+			return
+		default:
 		}
-		for _, i := range tweet.Videos {
-			j := fmt.Sprintf("%s", i)
-			v := vidUrl(j)
-			wg.Add(1)
-			go download(wg, v, opt.Output, opt.Username, GUI)
-		}
+		// Use URL directly instead of fragile fmt.Sprintf parsing
+		v := strings.Split(i.URL, "?")[0]
+		wg.Add(1)
+		go download(wg, v, opt.Output, opt.Username, GUI)
 	}
 }
 
 func photoUser(wg *sync.WaitGroup, tweet *twitterscraper.TweetResult, opt Opts) {
-	if len(tweet.Photos) > 0 {
-		if tweet.IsRetweet && (opt.Retweet || opt.Retweet_only) {
-			opt.Tweet_id = tweet.ID
-			opt.Output = opt.Output + "/" + opt.Username
-			SingleTDownload(wg, opt, true, false)
+	if tweet.IsRetweet && (opt.Retweet || opt.Retweet_only) {
+		opt.Tweet_id = tweet.ID
+		rtOpt := opt
+		rtOpt.Output = opt.Output + "/" + opt.Username
+		SingleTDownload(wg, rtOpt, true, false)
+		return
+	}
+	if opt.Retweet_only {
+		return
+	}
+	for _, i := range tweet.Photos {
+		select {
+		case <-Stop:
+			return
+		default:
 		}
-		for _, i := range tweet.Photos {
-			select {
-			case <-Stop:
-				return
-			default:
-			}
-
-			if opt.Retweet_only || tweet.IsRetweet {
-				continue
-			}
-			var url string
-			if !strings.Contains(i.URL, "video_thumb/") {
-				if quality[opt.Size] == "orig" || quality[opt.Size] == "small" {
-					url = i.URL + "?name=" + quality[opt.Size]
-				} else {
-					url = i.URL
-				}
-				wg.Add(1)
-				go download(wg, url, opt.Output, opt.Username, GUI)
-			}
+		if strings.Contains(i.URL, "video_thumb/") {
+			continue
 		}
+		var url string
+		if quality[opt.Size] == "orig" || quality[opt.Size] == "small" {
+			url = i.URL + "?name=" + quality[opt.Size]
+		} else {
+			url = i.URL
+		}
+		wg.Add(1)
+		go download(wg, url, opt.Output, opt.Username, GUI)
 	}
 }
 
@@ -177,23 +253,27 @@ func BatchTDownload(opt Opts) {
 	}
 
 	for scanner.Scan() {
-		opt.Tweet_id = scanner.Text()
-		go SingleTDownload(&wg, opt, false, true)
+		line := strings.TrimSpace(scanner.Text())
+		if line == "" {
+			continue
+		}
+		opt.Tweet_id = line
+		wg.Add(1)
+		go func(o Opts) {
+			defer wg.Done()
+			SingleTDownload(&wg, o, false, true)
+		}(opt)
 	}
-	// Ugly wait for waiting first wg.Add in singleTDownlaod
-	time.Sleep(10 * time.Second)
 	wg.Wait()
 }
 
 func SingleTDownload(wg *sync.WaitGroup, opt Opts, rt bool, batch bool) {
-	if !rt || !batch {
-		if opt.Proxy != "" {
-			proxyURL, _ := URL.Parse(opt.Proxy)
-			client = &http.Client{
-				Transport: &http.Transport{
-					Proxy: http.ProxyURL(proxyURL),
-				},
-			}
+	if opt.Proxy != "" && (!rt && !batch) {
+		proxyURL, _ := URL.Parse(opt.Proxy)
+		client = &http.Client{
+			Transport: &http.Transport{
+				Proxy: http.ProxyURL(proxyURL),
+			},
 		}
 	}
 	scraper := twitterscraper.New()
@@ -204,100 +284,96 @@ func SingleTDownload(wg *sync.WaitGroup, opt Opts, rt bool, batch bool) {
 		return
 	}
 
-	var gwg sync.WaitGroup
-	gwg.Add(1)
-	go func() {
-		defer gwg.Done()
-		if len(tweet.Videos) > 0 {
-			for _, i := range tweet.Videos {
-				select {
-				case <-Stop:
-					return
-				default:
-				}
+	// Show metadata in SingleTweet log (not for retweet processing or batch)
+	if GUI && !rt && !batch && opt.Metadata {
+		logTweetInfo(tweet, LogSingle)
+	}
 
-				j := fmt.Sprintf("%s", i)
-				v := vidUrl(j)
-				if GUI {
-					wg.Add(1)
-					go download(wg, v, opt.Output, "", true)
-					if !rt && !batch {
-						n := Name(v)
-						mu.Lock()
-						ui.QueueMain(func() {
+	// Process videos
+	for _, i := range tweet.Videos {
+		select {
+		case <-Stop:
+			return
+		default:
+		}
+		v := strings.Split(i.URL, "?")[0]
+		wg.Add(1)
+		if GUI {
+			go func(url string) {
+				download(wg, url, opt.Output, "", true)
+				if !rt && !batch {
+					n := Name(url)
+					mu.Lock()
+					ui.QueueMain(func() {
+						if LogSingle != nil {
 							LogSingle.Append("Downloaded vid: " + n + "\n")
-						})
-						mu.Unlock()
-					}
-				} else {
-					wg.Add(1)
-					go download(wg, v, opt.Output, "", false)
-				}
-			}
-		}
-	}()
-	gwg.Add(1)
-	go func() {
-		defer gwg.Done()
-		if len(tweet.Photos) > 0 {
-			for _, i := range tweet.Photos {
-				select {
-				case <-Stop:
-					return
-				default:
-				}
-				var url string
-				if !strings.Contains(i.URL, "video_thumb/") {
-					if quality[opt.Size] == "orig" || quality[opt.Size] == "small" {
-						url = i.URL + "?name=" + quality[opt.Size]
-					} else {
-						url = i.URL
-					}
-					if GUI {
-						wg.Add(1)
-						go download(wg, url, opt.Output, "", true)
-						if !rt && !batch {
-							n := Name(url)
-							mu.Lock()
-							ui.QueueMain(func() {
-								LogSingle.Append("Downloaded img: " + n + "\n")
-							})
-							mu.Unlock()
 						}
-					} else {
-						wg.Add(1)
-						go download(wg, url, opt.Output, "", false)
-					}
+					})
+					mu.Unlock()
 				}
-			}
+			}(v)
+		} else {
+			go download(wg, v, opt.Output, "", false)
 		}
-	}()
-	gwg.Wait()
+	}
+
+	// Process photos
+	for _, i := range tweet.Photos {
+		select {
+		case <-Stop:
+			return
+		default:
+		}
+		if strings.Contains(i.URL, "video_thumb/") {
+			continue
+		}
+		var url string
+		if quality[opt.Size] == "orig" || quality[opt.Size] == "small" {
+			url = i.URL + "?name=" + quality[opt.Size]
+		} else {
+			url = i.URL
+		}
+		wg.Add(1)
+		if GUI {
+			go func(u string) {
+				download(wg, u, opt.Output, "", true)
+				if !rt && !batch {
+					n := Name(u)
+					mu.Lock()
+					ui.QueueMain(func() {
+						if LogSingle != nil {
+							LogSingle.Append("Downloaded img: " + n + "\n")
+						}
+					})
+					mu.Unlock()
+				}
+			}(url)
+		} else {
+			go download(wg, url, opt.Output, "", false)
+		}
+	}
+
 	if GUI && !rt && !batch {
-		fmt.Print("wait")
 		wg.Wait()
-		fmt.Print("Done")
 		mu.Lock()
 		ui.QueueMain(func() {
-			LogSingle.Append("--------------------------\n")
+			if LogSingle != nil {
+				LogSingle.Append("--------------------------\n")
+			}
 		})
 		mu.Unlock()
 	}
 }
 
-func vidUrl(video string) string {
-	vid := strings.Split(string(video), " ")
-	v := vid[len(vid)-1]
-	v = strings.TrimSuffix(v, "}")
-	vid = strings.Split(v, "?")
-	return vid[0]
-}
-
+// download fetches a media URL and saves it to disk.
+// Context cancellation is used to support the Stop channel,
+// so there is no deadlock from the old finish-channel approach.
 func download(wg *sync.WaitGroup, url string, output string, user string, gui bool) {
 	defer wg.Done()
+
+	// Bail out immediately if already stopped
 	select {
 	case <-Stop:
-		wg.Done()
 		return
 	default:
 	}
@@ -306,6 +382,16 @@ func download(wg *sync.WaitGroup, url string, output string, user string, gui bo
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
+
+	// Cancel the HTTP request when Stop fires
+	go func() {
+		select {
+		case <-Stop:
+			cancel()
+		case <-ctx.Done():
+		}
+	}()
+
 	req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
 	if err != nil {
 		if gui {
@@ -315,53 +401,26 @@ func download(wg *sync.WaitGroup, url string, output string, user string, gui bo
 		}
 		return
 	}
-
 	req.Header.Add("User-Agent", "Mozilla/5.0 (X11; Linux x86_64)")
-	var resp *http.Response
 
-	finish := make(chan bool)
-	var http_err error
-	hwg := sync.WaitGroup{}
-	hwg.Add(2)
-	go func() {
-		defer hwg.Done()
-		resp, http_err = client.Do(req)
-		if http_err != nil {
-			return
-		}
-		finish <- true
-	}()
-	go func() {
-		defer hwg.Done()
-		for {
-			select {
-			case <-Stop:
-				cancel()
-				return
-			case <-finish:
-				return
-			default:
+	resp, err := client.Do(req)
+	if err != nil {
+		if !errors.Is(err, context.Canceled) {
+			if gui {
+				LogErr("http: " + err.Error())
+			} else {
+				fmt.Println(err.Error())
 			}
-		}
-	}()
-	hwg.Wait()
-
-	if http_err != nil {
-		if gui {
-			LogErr("http_err: " + http_err.Error())
-		} else {
-			fmt.Println(err.Error())
 		}
 		return
 	}
-
 	defer resp.Body.Close()
 
 	if resp.StatusCode != 200 {
 		return
 	}
+
 	var f *os.File
-	defer f.Close()
 	var ferr error
 	if user != "" {
 		f, ferr = os.Create(output + "/" + user + "/" + name)
@@ -372,45 +431,23 @@ func download(wg *sync.WaitGroup, url string, output string, user string, gui bo
 		if gui {
 			LogErr("file: " + ferr.Error())
 		} else {
-			fmt.Println(err.Error())
+			fmt.Println(ferr.Error())
 		}
 		return
 	}
-	var cerr error
-	cwg := sync.WaitGroup{}
-	cwg.Add(2)
-	go func() {
-		defer cwg.Done()
-		_, cerr = io.Copy(f, resp.Body)
-		if cerr != nil {
-			finish <- true
-			return
-		}
-		finish <- true
-	}()
-	go func() {
-		defer cwg.Done()
-		for {
-			select {
-			case <-Stop:
-				cancel()
-				return
-			case <-finish:
-				return
-			default:
+	defer f.Close()
+
+	_, cerr := io.Copy(f, resp.Body)
+	if cerr != nil {
+		if !errors.Is(cerr, context.Canceled) {
+			if gui {
+				LogErr("Copy: " + cerr.Error())
+			} else {
+				fmt.Println("Copy: " + cerr.Error())
 			}
 		}
-	}()
-	cwg.Wait()
-
-	if cerr != nil {
-		if gui {
-			LogErr("Copy: " + cerr.Error())
-			return
-		} else {
-			fmt.Println("Copy: " + cerr.Error())
-			return
-		}
+		return
 	}
 	fmt.Println("Download: ", name)
 }
+

@@ -24,21 +24,96 @@ import (
 )
 
 var (
-	usr     string
-	format  string
-	proxy   string
-	update  bool
-	onlyrtw bool
-	onlymtw bool
-	vidz    bool
-	imgs    bool
-	urlOnly bool
-	version = "1.15.0"
-	scraper *twitterscraper.Scraper
-	client  *http.Client
-	size    = "orig"
-	datefmt = "2006-01-02"
+	usr      string
+	format   string
+	proxy    string
+	update   bool
+	onlyrtw  bool
+	onlymtw  bool
+	vidz     bool
+	imgs     bool
+	urlOnly  bool
+	metadata bool
+	version  = "1.15.0"
+	scraper  *twitterscraper.Scraper
+	client   *http.Client
+	size     = "orig"
+	datefmt  = "2006-01-02"
 )
+
+// TweetMetadata holds all metadata for a single tweet (used for JSON output).
+type TweetMetadata struct {
+	ID           string      `json:"id"`
+	Username     string      `json:"username"`
+	Name         string      `json:"name"`
+	Text         string      `json:"text"`
+	Timestamp    string      `json:"timestamp"`
+	Likes        int         `json:"likes"`
+	Retweets     int         `json:"retweets"`
+	Replies      int         `json:"replies"`
+	Views        int         `json:"views"`
+	PermanentURL string      `json:"permanent_url"`
+	IsRetweet    bool        `json:"is_retweet"`
+	Media        []MediaInfo `json:"media"`
+}
+
+// MediaInfo describes a single photo or video attached to a tweet.
+type MediaInfo struct {
+	Type    string `json:"type"`
+	URL     string `json:"url"`
+	Preview string `json:"preview,omitempty"`
+}
+
+func buildMetadata(tweet *twitterscraper.Tweet) TweetMetadata {
+	m := TweetMetadata{
+		ID:           tweet.ID,
+		Username:     tweet.Username,
+		Name:         tweet.Name,
+		Text:         tweet.Text,
+		Timestamp:    tweet.TimeParsed.Format(time.RFC3339),
+		Likes:        tweet.Likes,
+		Retweets:     tweet.Retweets,
+		Replies:      tweet.Replies,
+		Views:        tweet.Views,
+		PermanentURL: tweet.PermanentURL,
+		IsRetweet:    tweet.IsRetweet,
+	}
+	for _, p := range tweet.Photos {
+		m.Media = append(m.Media, MediaInfo{Type: "photo", URL: p.URL})
+	}
+	for _, v := range tweet.Videos {
+		m.Media = append(m.Media, MediaInfo{Type: "video", URL: strings.Split(v.URL, "?")[0], Preview: v.Preview})
+	}
+	return m
+}
+
+func printMetadata(m TweetMetadata) {
+	fmt.Printf("--- @%s (%s) | %s ---\n", m.Username, m.Name, m.Timestamp)
+	fmt.Printf("Text   : %s\n", m.Text)
+	fmt.Printf("Likes  : %d  Retweets: %d  Replies: %d  Views: %d\n", m.Likes, m.Retweets, m.Replies, m.Views)
+	fmt.Printf("URL    : %s\n", m.PermanentURL)
+	fmt.Printf("Media  :\n")
+	for _, mi := range m.Media {
+		if mi.Preview != "" {
+			fmt.Printf("  [%s] %s  (preview: %s)\n", mi.Type, mi.URL, mi.Preview)
+		} else {
+			fmt.Printf("  [%s] %s\n", mi.Type, mi.URL)
+		}
+	}
+	fmt.Println()
+}
+
+func saveMetadata(outputDir string, tweetID string, m TweetMetadata) {
+	data, err := json.MarshalIndent(m, "", "  ")
+	if err != nil {
+		fmt.Println("metadata marshal error:", err)
+		return
+	}
+	path := outputDir + "/" + tweetID + "_metadata.json"
+	if err := os.WriteFile(path, data, 0644); err != nil {
+		fmt.Println("metadata write error:", err)
+	}
+}
 
 func download(wg *sync.WaitGroup, tweet interface{}, url string, filetype string, output string, dwn_type string) {
 	defer wg.Done()
@@ -316,6 +391,11 @@ func singleTweet(output string, id string) {
 		fmt.Println("Error retrieve tweet")
 		return
 	}
+	if metadata {
+		m := buildMetadata(tweet)
+		printMetadata(m)
+		saveMetadata(output, tweet.ID, m)
+	}
 	if usr != "" {
 		if vidz {
 			videoSingle(tweet, output)
@@ -407,6 +487,7 @@ func main() {
 	op.On("-z", "--url", "Print media url without download it", &urlOnly)
 	op.On("-R", "--retweet-only", "Download only retweet", &onlyrtw)
 	op.On("-M", "--mediatweet-only", "Download only media tweet", &onlymtw)
+	op.On("-m", "--metadata", "Save tweet metadata as JSON (likes, retweets, text, media URLs)", &metadata)
 	op.On("-s", "--size SIZE", "Choose size between small|normal|large (default large)", &size)
 	op.On("-U", "--update", "Download missing tweet only", &update)
 	op.On("-o", "--output DIR", "Output directory", &output)
@@ -526,6 +607,11 @@ func main() {
 		if tweet.Error != nil {
 			fmt.Println(tweet.Error)
 			os.Exit(1)
+		}
+		if metadata {
+			m := buildMetadata(&tweet.Tweet)
+			printMetadata(m)
+			saveMetadata(output, tweet.ID, m)
 		}
 		if vidz {
 			wg.Add(1)
